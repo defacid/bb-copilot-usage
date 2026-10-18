@@ -1,6 +1,6 @@
 {
   "name": "bb-copilot-usage",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "type": "module",
   "engines": {
     "bb": ">=0.43",
@@ -17,7 +17,8 @@
     "skills": []
   },
   "dependencies": {
-    "@get-bb/plugin-sdk": "0.5.29",
+    "@get-bb/plugin-sdk": "0.6.49",
+    "@github/copilot-sdk": "1.0.22",
     "zod": "^4.3.6"
   },
   "devDependencies": {

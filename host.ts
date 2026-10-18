@@ -1,6 +1,8 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { access } from "node:fs/promises";
 import { homedir } from "node:os";
+import { dirname, extname, join } from "node:path";
 import { promisify } from "node:util";
 import {
   BRIDGE_JSON_RPC_ERRORS,
@@ -28,6 +30,17 @@ export function nextBillingReset(now = new Date()): string {
   const month = now.getUTCMonth();
   const candidate = resetInMonth(year, month);
   return (candidate.getTime() > now.getTime() ? candidate : resetInMonth(year, month + 1)).toISOString();
+}
+
+export function quotaReset(resetDate: string | undefined, now = new Date()): string {
+  const parsed = resetDate ? Date.parse(resetDate) : Number.NaN;
+  // Some CLI releases populate resetDate with the quota fetch timestamp. Only
+  // trust a plausible future reset; otherwise retain the known billing cycle.
+  if (Number.isFinite(parsed) && parsed > now.getTime() + 6 * 60 * 60 * 1_000
+    && parsed < now.getTime() + 45 * 24 * 60 * 60 * 1_000) {
+    return new Date(parsed).toISOString();
+  }
+  return nextBillingReset(now);
 }
 
 function resetInMonth(year: number, month: number): Date {
@@ -60,6 +73,100 @@ async function tmux(args: string[]): Promise<string> {
   return stdout;
 }
 
+async function windowsCopilotExecutable(executable: string): Promise<string> {
+  if (!new Set([".cmd", ".ps1"]).has(extname(executable).toLowerCase())) return executable;
+  const architecture = process.arch === "arm64" ? "arm64" : "x64";
+  const native = join(
+    dirname(executable),
+    "node_modules",
+    "@github",
+    "copilot",
+    "node_modules",
+    "@github",
+    `copilot-win32-${architecture}`,
+    "copilot.exe",
+  );
+  try {
+    await access(native);
+    return native;
+  } catch {
+    return executable;
+  }
+}
+
+async function resolveCopilotExecutable(): Promise<string | null> {
+  const resolved = await experimental_resolveExecutablePath("copilot");
+  if (resolved) return process.platform === "win32" ? windowsCopilotExecutable(resolved) : resolved;
+  if (process.platform !== "win32") return null;
+  const pathValue = process.env.PATH ?? process.env.Path ?? "";
+  for (const directory of pathValue.split(";").filter(Boolean)) {
+    for (const filename of ["copilot.exe", "copilot.cmd", "copilot.bat", "copilot.ps1"]) {
+      const candidate = join(directory.replace(/^"|"$/gu, ""), filename);
+      try {
+        await access(candidate);
+        return windowsCopilotExecutable(candidate);
+      } catch {}
+    }
+  }
+  return null;
+}
+
+interface AccountQuotaSnapshot {
+  entitlementRequests: number;
+  usedRequests: number;
+  remainingPercentage: number;
+  resetDate?: string;
+}
+
+export function resultFromSnapshots(
+  snapshots: Record<string, AccountQuotaSnapshot | undefined>,
+): ProviderUsageResult {
+  const preferred = snapshots.premium_interactions;
+  const entry = preferred
+    ? ["premium_interactions", preferred] as const
+    : Object.entries(snapshots).find(([, snapshot]) =>
+      snapshot && snapshot.entitlementRequests > 0 && Number.isFinite(snapshot.remainingPercentage));
+  if (!entry) return errorResult("Copilot did not return a finite account quota.");
+  const [kind, quota] = entry;
+  if (!quota) return errorResult("Copilot returned an invalid account quota.");
+  const usedPercent = Number.isFinite(quota.remainingPercentage)
+    ? 100 - quota.remainingPercentage
+    : quota.usedRequests / quota.entitlementRequests * 100;
+  return { supported: true, usage: {
+    status: "ok",
+    accountEmail: null,
+    planLabel: "GitHub Copilot",
+    windows: [{
+      label: kind === "premium_interactions" ? "Premium requests" : kind.replaceAll("_", " "),
+      usedPercent: Math.max(0, Math.min(100, usedPercent)),
+      resetsAt: quotaReset(quota.resetDate),
+    }],
+  } };
+}
+
+async function readUsageWithSdk(executable: string): Promise<ProviderUsageResult> {
+  const { CopilotClient, RuntimeConnection } = await import("@github/copilot-sdk");
+  const client = new CopilotClient({
+    connection: RuntimeConnection.forStdio({ path: await windowsCopilotExecutable(executable) }),
+    workingDirectory: homedir(),
+    logLevel: "none",
+    useLoggedInUser: true,
+  });
+  try {
+    await client.start();
+    const quota = await client.rpc.account.getQuota({});
+    return resultFromSnapshots(quota.quotaSnapshots);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/\b(?:auth(?:entication|enticated)?|unauthenticated|credential|log\s*in|login|token)\b/iu.test(message)) {
+      return { supported: true, usage: { status: "unauthenticated" } };
+    }
+    return errorResult(message);
+  } finally {
+    try { await client.stop(); } catch {}
+  }
+}
+
 function result(quota: ParsedQuota): ProviderUsageResult {
   if (!(quota.limit > 0) || !Number.isFinite(quota.used)) {
     return errorResult("Copilot returned an invalid quota.");
@@ -72,8 +179,11 @@ function result(quota: ParsedQuota): ProviderUsageResult {
 }
 
 async function readUsage(): Promise<ProviderUsageResult> {
-  const executable = await experimental_resolveExecutablePath("copilot");
+  const executable = await resolveCopilotExecutable();
   if (!executable) return { supported: true, usage: { status: "not_installed" } };
+  if (process.platform === "win32") {
+    return readUsageWithSdk(executable);
+  }
   // Copilot's TUI asks the terminal for capability/color responses before it
   // renders. node-pty alone does not emulate those replies, whereas tmux does.
   // Run a short-lived private tmux session, open /usage, and capture its pane.
